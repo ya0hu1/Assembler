@@ -649,12 +649,59 @@ int main(int argc, char**argv){
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    if(argc<2){
-        cerr<<"Usage: "<<argv[0]<<" input.s\n";
+    // ===== 命令行参数解析 =====
+    //   用法: prog [-o output.o] input.s
+    //   也兼容旧的位置参数形式: prog input.s output.o
+    //   -o <file>      指定输出文件名 (默认: output.o)
+    //   -o<file>       同上, 紧凑形式
+    //   -h, --help     显示帮助
+    string outfile = "output.o";   // 默认输出文件名
+    string infile;
+    bool outfile_set = false;      // 输出文件是否已被指定 (用于检测 -o 与位置参数冲突)
+
+    for(int i=1;i<argc;i++){
+        string arg = argv[i];
+        if(arg=="-o"){
+            if(i+1>=argc){
+                cerr<<"Error: option -o requires an argument\n";
+                cerr<<"Usage: "<<argv[0]<<" [-o output.o] input.s\n";
+                return 1;
+            }
+            outfile = argv[++i];
+            outfile_set = true;
+        } else if(arg.size()>2 && arg.substr(0,2)=="-o"){
+            // 紧凑形式 -ooutput.o
+            outfile = arg.substr(2);
+            outfile_set = true;
+        } else if(arg=="-h" || arg=="--help"){
+            cerr<<"Usage: "<<argv[0]<<" [-o output.o] input.s\n";
+            cerr<<"  -o <file>   指定输出文件名 (默认: output.o)\n";
+            return 0;
+        } else if(!arg.empty() && arg[0]=='-' && arg!="-"){
+            cerr<<"Error: unknown option '"<<arg<<"'\n";
+            cerr<<"Usage: "<<argv[0]<<" [-o output.o] input.s\n";
+            return 1;
+        } else {
+            // 位置参数: 第一个为输入文件; 若存在第二个, 则作为输出文件 (兼容旧用法)
+            if(infile.empty()){
+                infile = arg;
+            } else {
+                if(outfile_set){
+                    cerr<<"Error: output file specified twice (via -o and positionally)\n";
+                    cerr<<"Usage: "<<argv[0]<<" [-o output.o] input.s\n";
+                    return 1;
+                }
+                outfile = arg;
+                outfile_set = true;
+            }
+        }
+    }
+
+    if(infile.empty()){
+        cerr<<"Usage: "<<argv[0]<<" [-o output.o] input.s\n";
         return 1;
     }
 
-    string infile = argv[1];
     ifstream ifs(infile);
     if(!ifs){ cerr<<"Cannot open "<<infile<<"\n"; return 2; }
 
@@ -1024,9 +1071,9 @@ int main(int argc, char**argv){
 cout<<"=== SECOND PASS DONE ===\n";
 cout<<"Generated text.bin and data.bin\n";
 
-write_elf64_object("output.o", textout, dataout, symtab, text_relocs, data_relocs);
+write_elf64_object(outfile, textout, dataout, symtab, text_relocs, data_relocs);
 
-cout<<"Wrote ELF64 relocatable object: output.o\n";
+cout<<"Wrote ELF64 relocatable object: "<<outfile<<"\n";
     return 0;
 
 }

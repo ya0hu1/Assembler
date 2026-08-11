@@ -11,13 +11,22 @@ g++ -std=c++17 Assembler/Assembler.cpp -o myasstest
 ## 使用
 
 ```bash
-./myasstest test.s output.o
+# 默认输出到 output.o
+./myasstest test.s
+
+# 用 -o 指定输出文件名 (两种顺序均可)
+./myasstest -o out.o test.s
+./myasstest test.s -o out.o
+# 紧凑形式
+./myasstest -oout.o test.s
+# 也兼容旧的位置参数形式
+./myasstest test.s out.o
 ```
 
 使用 `readelf` 查看生成的 ELF 文件：
 
 ```bash
-readelf -a output.o
+readelf -a out.o
 ```
 
 ## 当前支持的指令集
