@@ -29,6 +29,24 @@ g++ -std=c++17 Assembler/Assembler.cpp -o myasstest
 readelf -a out.o
 ```
 
+## 错误诊断
+
+汇编器采用 gcc/clang 风格的诊断输出：`文件:行:列: error: 信息`，并附带出错的源码行与 `^` 光标定位。遇到错误会**收集全部**错误后统一退出（而非遇到第一个即终止），便于一次性修正：
+
+```
+p2.s:5:18: error: Unknown register: tXYZ
+      add  t1, t2, tXYZ
+                   ^
+p2.s:7:18: error: Undefined label: nowhere
+      beq  t0, t1, nowhere
+                   ^
+Assembler: 6 error(s) generated.
+```
+
+- 存在 `error` 时退出码为 `1`，且**不会**写出（可能不完整的）目标文件。
+- `warning`（如 `.globl` 声明未定义符号、`.word` 出现在 `.data` 之外）不阻断输出，仍正常生成 `.o`。
+- 已对立即数/移位量/分支与跳转偏移做范围检查，并对缺操作数、非法 `.align`、未定义符号等给出明确提示。
+
 ## 当前支持的指令集
 
 | 扩展 | 指令 |

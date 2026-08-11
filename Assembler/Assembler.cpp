@@ -2,18 +2,23 @@
 #include "write_elf64_object.h"
 using namespace std;
 
-vector<string> tokenize_line(const string &s_raw){
-    string s=s_raw;
-    vector<string> toks;
+// 核心分词: 返回 (token 文本, 起始列号(1-based)) 列表
+// 列号用于错误诊断时定位光标(^)位置
+vector<pair<string,int>> tokenize_with_cols(const string &s_raw){
+    const string &s = s_raw;
+    vector<pair<string,int>> toks;
     string cur;
+    int cur_col = 0;              // 当前 token 起始列 (1-based), 0 表示尚未开始
     auto push=[&](){
         if(!cur.empty()){
-            toks.push_back(cur);
+            toks.push_back({cur, cur_col});
             cur.clear();
+            cur_col = 0;
         }
     };
     for(size_t i=0;i<s.size();){
         char c=s[i];
+        int col = (int)i + 1;     // 1-based 列号
 
         // comments - support '#' ';' '//' as comment starts
         if(c=='#' || c==';' || (c=='/' && i+1<s.size() && s[i+1]=='/')) break;
@@ -32,39 +37,78 @@ vector<string> tokenize_line(const string &s_raw){
         // keep ':' '(' ')' as separate tokens (':' used for labels)
         if(c==':' ){
             push();
-            toks.push_back(":");
+            toks.push_back({":", col});
             i++;
             continue;
         }
         if(c=='(' || c==')'){
             push();
             string t(1,c);
-            toks.push_back(t);
+            toks.push_back({t, col});
             i++;
             continue;
         }
         // 引号内内容作为一个完整token（支持 .string "hello world"）
         if(c=='"'){
-            push();
-            cur.push_back(c);
+            push();                            // 先把已积累的 token 推出
+            string q;
+            size_t start = i;                  // 记录引号 token 起始列
+            q.push_back(c);
             i++;
             while(i<s.size() && s[i] != '"'){
-                cur.push_back(s[i]);
+                q.push_back(s[i]);
                 i++;
             }
             if(i<s.size()){
-                cur.push_back(s[i]); // 闭合引号
+                q.push_back(s[i]);             // 闭合引号
                 i++;
             }
-            push();
+            toks.push_back({q, (int)start + 1});
             continue;
         }
         // other chars part of token
+        if(cur.empty()) cur_col = col;
         cur.push_back(c);
         i++;
     }
     push();
     return toks;
+}
+
+vector<string> tokenize_line(const string &s_raw){
+    auto pv = tokenize_with_cols(s_raw);
+    vector<string> toks;
+    toks.reserve(pv.size());
+    for(auto &p : pv) toks.push_back(p.first);
+    return toks;
+}
+
+// 在源行中查找某 token 文本首次出现的列号 (1-based), 找不到返回 0
+// 用于错误诊断时定位光标位置
+int find_token_col(const string &raw, const string &tok){
+    if(tok.empty()) return 0;
+    for(auto &p : tokenize_with_cols(raw)){
+        if(p.first == tok) return p.second;
+    }
+    return 0;
+}
+
+// 从异常消息中提取可能的出错 token 文本, 用于定位光标
+// 例: "Unknown register: tx"         -> "tx"
+//     "Immediate parse error: 'abc'" -> "abc"
+//     "Undefined label: foo"         -> "foo"
+// 找不到则返回空串
+string extract_token_from_msg(const string &msg){
+    // 优先匹配单引号 '...' 中的内容
+    size_t q1 = msg.find('\'');
+    if(q1 != string::npos){
+        size_t q2 = msg.find('\'', q1+1);
+        if(q2 != string::npos && q2 > q1+1) return msg.substr(q1+1, q2-q1-1);
+    }
+    // 其次取最后一个 ": " 之后的内容
+    size_t pos = msg.rfind(": ");
+    if(pos != string::npos) return msg.substr(pos+2);
+    return "";
 }
 
 
@@ -713,13 +757,50 @@ int main(int argc, char**argv){
         lines.push_back({lineno,raw});
     }
 
+    // ===== 错误诊断子系统 =====
+    // 统一错误/警告输出格式: file:line:col: error: msg  + 源码上下文 + 光标(^)
+    // 收集全部错误后统一退出, 而非遇到第一个错误即终止 (修复 P10: 遇错即退出)
+    int err_count = 0;
+    int warn_count = 0;
+
+    // 按行号 (1-based, 顺序连续) 取原始源行; 越界返回空串
+    auto get_raw_line = [&](size_t ln) -> string {
+        if(ln>=1 && ln<=lines.size()) return lines[ln-1].raw;
+        return "";
+    };
+
+    // 输出一条诊断信息; kind 为 "error" 或 "warning"
+    auto diagnose = [&](size_t ln, int col, const string &kind, const string &msg){
+        if(kind=="error") err_count++; else warn_count++;
+        cerr<<infile<<":"<<ln;
+        if(col>0) cerr<<":"<<col;
+        cerr<<": "<<kind<<": "<<msg<<"\n";
+        string rawline = get_raw_line(ln);
+        if(!rawline.empty()){
+            cerr<<"  "<<rawline<<"\n";
+            if(col>0) cerr<<string((size_t)col+1, ' ')<<"^\n";
+        }
+    };
+
+    // 报错: 根据 msg (或显式 tok_hint) 在源行中定位列号后输出
+    auto report_error = [&](size_t ln, const string &msg, const string &tok_hint=""){
+        string tok = tok_hint.empty() ? extract_token_from_msg(msg) : tok_hint;
+        int col = tok.empty() ? 0 : find_token_col(get_raw_line(ln), tok);
+        diagnose(ln, col, "error", msg);
+    };
+    auto report_warning = [&](size_t ln, const string &msg, const string &tok_hint=""){
+        string tok = tok_hint.empty() ? extract_token_from_msg(msg) : tok_hint;
+        int col = tok.empty() ? 0 : find_token_col(get_raw_line(ln), tok);
+        diagnose(ln, col, "warning", msg);
+    };
+
     //Data structures for first pass
     SectionKind cursec=SEC_NONE;
     uint32_t text_off=0;
     uint32_t data_off=0;
     vector<Instr> instrs;
     unordered_map<string,Label> symtab;
-    set<string> global_names; // .globl声明的符号名
+    unordered_map<string,size_t> global_names; // .globl声明的符号名 -> 声明所在行号
     vector<string> pending_labels; // 延迟记录的标签(修复 Bug-A2)
     auto flush_labels = [&](){
         for(auto &lbl : pending_labels){
@@ -730,6 +811,7 @@ int main(int argc, char**argv){
     };
 
     for(auto&L :lines){
+      try {
         auto toks=tokenize_line(L.raw);
         if(toks.empty()) continue;
 
@@ -753,11 +835,12 @@ int main(int argc, char**argv){
                 cursec = SEC_DATA;
                 continue;
             } else if(d==".globl" || d==".global"){
-                if(toks.size()>=2) global_names.insert(toks[1]);
+                if(toks.size()>=2) global_names[toks[1]] = L.lineno;
                 continue;
             } else if(d==".align"){
                 if(toks.size()>=2){
                     long long val = stoll(toks[1]);
+                    if(val<0 || val>31) throw runtime_error(".align requires value in range 0-31");
                     uint32_t align = (1u<<val);
                     if(cursec==SEC_TEXT) text_off = ( (text_off + align - 1) / align ) * align;
                     if(cursec==SEC_DATA) data_off = ( (data_off + align - 1) / align ) * align;
@@ -767,7 +850,7 @@ int main(int argc, char**argv){
             }else if(d==".word"||d==".4byte"){
                 data_off = (data_off + 3) & ~3u; // 对齐4字节 (修复 Bug-A3)
                 flush_labels();
-                if(cursec!=SEC_DATA) cerr<<"Warning .word outside .data at line "<<L.lineno<<"\n";
+                if(cursec!=SEC_DATA) report_warning(L.lineno, d+" directive used outside .data section", d);
                 Instr ins; ins.lineno=L.lineno; ins.sec=SEC_DATA;
                 ins.offset=data_off; ins.toks=toks;
                 instrs.push_back(ins); data_off+=4; continue;
@@ -802,8 +885,8 @@ int main(int argc, char**argv){
             }
         }
         if(cursec==SEC_NONE){
-            cerr<<"Error: instruction outside any section at line "<<L.lineno<<"\n";
-            return 3;
+            report_error(L.lineno, "instruction outside any section (expected .text or .data)", toks[0]);
+            continue;
         }
         flush_labels();
 
@@ -844,18 +927,29 @@ int main(int argc, char**argv){
                 data_off += 4;
             }
         }
-    }    
+      } catch(exception& e){
+        report_error(L.lineno, e.what());
+      }
+    }
 
     flush_labels(); // flush 残留标签
-    // 标记全局符号
-    for(auto &gn : global_names){
-        auto it = symtab.find(gn);
+    // 标记全局符号; .globl 声明但未定义的符号给出警告
+    for(auto &gv : global_names){
+        auto it = symtab.find(gv.first);
         if(it != symtab.end()) it->second.is_global = true;
+        else report_warning(gv.second, ".globl declares undefined symbol '"+gv.first+"'", gv.first);
+    }
+
+    // 第一遍若存在错误, 汇总后退出, 不进入第二遍 (避免级联错误)
+    if(err_count>0){
+        cerr<<"Assembler: "<<err_count<<" error(s) generated in first pass.\n";
+        return 1;
     }
 
     //first pass done
     // Print first pass summary (optional)
     cout<<"=== First pass results ===\n";
+    cout.flush();   // 确保 pass-1 进度信息先于 pass-2 的 cerr 诊断输出, 避免缓冲交错
 
     vector<RelocEntry> text_relocs, data_relocs;
 
@@ -875,6 +969,7 @@ int main(int argc, char**argv){
             if(ins.toks.empty()) continue;
             string d = ins.toks[0];
             try {
+                if(ins.toks.size()<2) throw runtime_error(d+" requires an operand");
                 if(d==".word"||d==".4byte"){
                     if(ins.offset + 4 > dataout.size()) throw runtime_error("data overflow");
                     bool is_imm = true; long long v = 0;
@@ -909,8 +1004,7 @@ int main(int argc, char**argv){
                     memcpy(&dataout[ins.offset], s.data(), s.size());
                 }
             } catch(exception &e){
-                cerr<<"Error at line "<<ins.lineno<<": "<<e.what()<<"\n";
-                return 7;
+                report_error(ins.lineno, e.what());
             }
             continue;
         }
@@ -926,80 +1020,82 @@ int main(int argc, char**argv){
             if(def){
                 switch(def->format){
                 case FMT_R:
-                    if(ins.toks.size()<4) throw runtime_error("operand count");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     encoded = pack_r(def->funct7, reg_id(ins.toks[3]), reg_id(ins.toks[2]),
                                      def->funct3, reg_id(ins.toks[1]), def->opcode);
                     break;
                 case FMT_I_ARITH:
                 case FMT_I_ARITH_W: {
-                    if(ins.toks.size()<4) throw runtime_error("operand count");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); int rs1=reg_id(ins.toks[2]);
                     long long imm=parse_imm(ins.toks[3]);
-                    if(!fits_signed(imm,12)) throw runtime_error("imm out of range");
+                    if(!fits_signed(imm,12)) throw runtime_error("immediate "+ins.toks[3]+" out of range (12-bit signed)");
                     encoded = pack_i((int32_t)imm, rs1, def->funct3, rd, def->opcode);
                     break;
                 }
                 case FMT_I_SHIFT: {
-                    if(ins.toks.size()<4) throw runtime_error("operand count");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); int rs1=reg_id(ins.toks[2]);
                     long long shamt=parse_imm(ins.toks[3]);
-                    if(shamt<0||shamt>63) throw runtime_error("shamt out of range");
+                    if(shamt<0||shamt>63) throw runtime_error("shift amount "+ins.toks[3]+" out of range (0-63)");
                     encoded = (def->funct7<<25)|((uint32_t)shamt<<20)|(rs1<<15)|(def->funct3<<12)|(rd<<7)|def->opcode;
                     break;
                 }
                 case FMT_I_SHIFT_W: {
-                    if(ins.toks.size()<4) throw runtime_error("operand count");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); int rs1=reg_id(ins.toks[2]);
                     long long shamt=parse_imm(ins.toks[3]);
-                    if(shamt<0||shamt>31) throw runtime_error("shamt out of range");
+                    if(shamt<0||shamt>31) throw runtime_error("shift amount "+ins.toks[3]+" out of range (0-31)");
                     encoded = (def->funct7<<25)|((uint32_t)shamt<<20)|(rs1<<15)|(def->funct3<<12)|(rd<<7)|def->opcode;
                     break;
                 }
                 case FMT_I_LOAD: {
-                    if(ins.toks.size()<4) throw runtime_error("bad load");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); auto mem=parse_mem_operand(ins.toks,2);
-                    if(!fits_signed(mem.first,12)) throw runtime_error("load imm out of range");
+                    if(!fits_signed(mem.first,12)) throw runtime_error("load offset "+to_string(mem.first)+" out of range (12-bit signed)");
                     encoded = pack_i((int32_t)mem.first, mem.second, def->funct3, rd, def->opcode);
                     break;
                 }
                 case FMT_I_JALR: {
-                    if(ins.toks.size()<4) throw runtime_error("bad jalr");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); int rs1=reg_id(ins.toks[2]);
                     long long imm=parse_imm(ins.toks[3]);
                     encoded = pack_i((int32_t)imm, rs1, def->funct3, rd, def->opcode);
                     break;
                 }
                 case FMT_S: {
-                    if(ins.toks.size()<4) throw runtime_error("bad store");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rs2=reg_id(ins.toks[1]); auto mem=parse_mem_operand(ins.toks,2);
-                    if(!fits_signed(mem.first,12)) throw runtime_error("store imm out of range");
+                    if(!fits_signed(mem.first,12)) throw runtime_error("store offset "+to_string(mem.first)+" out of range (12-bit signed)");
                     encoded = pack_s((int32_t)mem.first, rs2, mem.second, def->funct3, def->opcode);
                     break;
                 }
                 case FMT_B: {
-                    if(ins.toks.size()<4) throw runtime_error("bad branch");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rs1=reg_id(ins.toks[1]); int rs2=reg_id(ins.toks[2]);
                     uint32_t tgt=get_label_addr(ins.toks[3]);
                     long long rel=(long long)tgt-(long long)ins.offset;
+                    if(!fits_signed(rel,13)) throw runtime_error("branch target out of range (offset "+to_string(rel)+", must fit ±4KiB)");
                     encoded = pack_b((int32_t)rel, rs2, rs1, def->funct3, def->opcode);
                     break;
                 }
                 case FMT_U: {
-                    if(ins.toks.size()<3) throw runtime_error("bad u-type");
+                    if(ins.toks.size()<3) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); long long imm=parse_imm(ins.toks[2]);
                     encoded = pack_u((int32_t)imm, rd, def->opcode);
                     break;
                 }
                 case FMT_J: {
-                    if(ins.toks.size()<3) throw runtime_error("bad jal");
+                    if(ins.toks.size()<3) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]); uint32_t tgt=get_label_addr(ins.toks[2]);
                     long long rel=(long long)tgt-(long long)ins.offset;
+                    if(!fits_signed(rel,21)) throw runtime_error("jal target out of range (offset "+to_string(rel)+", must fit ±1MiB)");
                     encoded = pack_j((int32_t)rel, rd, def->opcode);
                     break;
                 }
                 case FMT_I_CSR: {
                     // csrrw rd, csr, rs1
-                    if(ins.toks.size()<4) throw runtime_error("bad csr");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]);
                     uint32_t csr=parse_csr(ins.toks[2]);
                     int rs1=reg_id(ins.toks[3]);
@@ -1008,11 +1104,11 @@ int main(int argc, char**argv){
                 }
                 case FMT_I_CSR_IMM: {
                     // csrrwi rd, csr, imm5
-                    if(ins.toks.size()<4) throw runtime_error("bad csr-imm");
+                    if(ins.toks.size()<4) throw runtime_error("too few operands for '"+op+"'");
                     int rd=reg_id(ins.toks[1]);
                     uint32_t csr=parse_csr(ins.toks[2]);
                     long long imm=parse_imm(ins.toks[3]);
-                    if(imm<0||imm>31) throw runtime_error("csr imm out of range");
+                    if(imm<0||imm>31) throw runtime_error("csr immediate "+ins.toks[3]+" out of range (0-31)");
                     encoded = (csr<<20)|((uint32_t)imm<<15)|(def->funct3<<12)|(rd<<7)|def->opcode;
                     break;
                 }
@@ -1026,6 +1122,7 @@ int main(int argc, char**argv){
             // __la_hi rd, symbol -> lui rd, 0 + R_RISCV_HI20 (统一走重定位)
             // 修复 Bug-A1: 本地符号也必须产生重定位, 由链接器回填最终地址
             else if(op=="__la_hi"){
+                if(ins.toks.size()<3) throw runtime_error("too few operands for 'la'");
                 int rd = reg_id(ins.toks[1]);
                 string symname = ins.toks[2];
                 encoded = encode_u_type("lui", rd, 0);
@@ -1034,6 +1131,7 @@ int main(int argc, char**argv){
             // __la_lo rd, symbol -> addi rd, rd, 0 + R_RISCV_LO12_I (统一走重定位)
             // 修复 Bug-A1: 本地符号也必须产生重定位, 由链接器回填最终地址
             else if(op=="__la_lo"){
+                if(ins.toks.size()<3) throw runtime_error("too few operands for 'la'");
                 int rd = reg_id(ins.toks[1]);
                 string symname = ins.toks[2];
                 encoded = encode_i_type("addi", rd, rd, 0);
@@ -1041,6 +1139,7 @@ int main(int argc, char**argv){
             }
             // fence pred, succ -> 编码为 0x0f 类型
             else if(op=="__fence"){
+                if(ins.toks.size()<3) throw runtime_error("too few operands for 'fence'");
                 int pred = parse_fence_arg(ins.toks[1]);
                 int succ = parse_fence_arg(ins.toks[2]);
                 encoded = ((pred<<4 | succ) << 20) | 0x0f;
@@ -1054,11 +1153,11 @@ int main(int argc, char**argv){
             }
             }
             catch(exception &e){
-                cerr<<"Error at line "<<ins.lineno<<": "<<e.what()<<"\n";
-                return 5;
+                report_error(ins.lineno, e.what());
+                continue;
             }
 
-            if(ins.offset + 4 > textout.size()){ cerr<<"text buffer overflow\n"; return 6; }
+            if(ins.offset + 4 > textout.size()){ report_error(ins.lineno, "text section buffer overflow"); continue; }
             // write little-endian
             uint32_t w = encoded;
             textout[ins.offset+0] = w & 0xff;
@@ -1066,6 +1165,15 @@ int main(int argc, char**argv){
             textout[ins.offset+2] = (w>>16) & 0xff;
             textout[ins.offset+3] = (w>>24) & 0xff;
         }
+    }
+
+    // 第二遍结束: 若存在错误, 汇总后退出, 不写出 (可能不完整的) 目标文件
+    if(err_count>0){
+        if(warn_count>0)
+            cerr<<"Assembler: "<<err_count<<" error(s), "<<warn_count<<" warning(s) generated.\n";
+        else
+            cerr<<"Assembler: "<<err_count<<" error(s) generated.\n";
+        return 1;
     }
 
 cout<<"=== SECOND PASS DONE ===\n";
